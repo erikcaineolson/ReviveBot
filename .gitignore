@@ -6,3 +6,7 @@ venv/
 *.egg-info/
 dist/
 build/
+ad-suite/
+sites/
+.playwright
+
