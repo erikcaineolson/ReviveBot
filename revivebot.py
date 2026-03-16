@@ -108,18 +108,39 @@ class ReviveBot:
 
     # -- Advertiser -----------------------------------------------------------
 
-    def create_advertiser(self, name: str) -> int:
+    def create_advertiser(self, name: str, contact: str = '', email: str = '') -> int:
         self.page.goto(self._url('advertiser-edit.php'))
         self.page.wait_for_load_state('networkidle')
 
         self.page.locator('input[name="clientname"]').fill(name)
+
+        # Fill contact and email if the fields exist (required on some setups)
+        contact_field = self.page.locator('input[name="contact"]')
+        if contact_field.count() > 0:
+            contact_field.fill(contact or name)
+        email_field = self.page.locator('input[name="email"]')
+        if email_field.count() > 0:
+            email_field.fill(email or f'{name.lower().replace(" ", "")}@example.com')
+
         self.page.get_by_role('button', name='Save changes').click()
         self.page.wait_for_load_state('networkidle')
 
+        # Try extracting from URL first
         client_id = extract_id_from_url(self.page.url, 'clientid')
-        if not client_id:
-            raise RuntimeError(f"Could not extract clientid after creating advertiser. URL: {self.page.url}")
-        return client_id
+        if client_id:
+            return client_id
+
+        # If redirected to advertiser list, find the newly created advertiser
+        rows = self.page.locator('table tbody:nth-child(2) tr').all()
+        for row in rows:
+            first_cell = row.locator('td').first
+            cell_text = first_cell.inner_text().strip()
+            if name in cell_text:
+                id_match = re.search(r'\[(\d+)\]', cell_text)
+                if id_match:
+                    return int(id_match.group(1))
+
+        raise RuntimeError(f"Could not find clientid after creating advertiser. URL: {self.page.url}")
 
     # -- Campaign -------------------------------------------------------------
 
@@ -128,13 +149,34 @@ class ReviveBot:
         self.page.wait_for_load_state('networkidle')
 
         self.page.locator('input[name="campaignname"]').fill(name)
+
+        # Select campaign type (required) - default to Remnant (value="1")
+        remnant_radio = self.page.locator('input[name="campaign_type"][value="1"]')
+        if remnant_radio.count() > 0:
+            remnant_radio.check()
+
         self.page.get_by_role('button', name='Save changes').click()
         self.page.wait_for_load_state('networkidle')
 
+        # Try extracting from URL first
         campaign_id = extract_id_from_url(self.page.url, 'campaignid')
-        if not campaign_id:
-            raise RuntimeError(f"Could not extract campaignid after creating campaign. URL: {self.page.url}")
-        return campaign_id
+        if campaign_id:
+            return campaign_id
+
+        # Navigate to campaign list and find it
+        self.page.goto(self._url(f'advertiser-campaigns.php?clientid={client_id}'))
+        self.page.wait_for_load_state('networkidle')
+
+        rows = self.page.locator('table tbody:nth-child(2) tr').all()
+        for row in rows:
+            first_cell = row.locator('td').first
+            cell_text = first_cell.inner_text().strip()
+            if name in cell_text:
+                id_match = re.search(r'\[(\d+)\]', cell_text)
+                if id_match:
+                    return int(id_match.group(1))
+
+        raise RuntimeError(f"Could not find campaignid after creating campaign.")
 
     # -- Banner ---------------------------------------------------------------
 
@@ -190,9 +232,25 @@ class ReviveBot:
         self.page.wait_for_load_state('networkidle')
 
         banner_id = extract_id_from_url(self.page.url, 'bannerid')
-        if not banner_id:
-            raise RuntimeError(f"Could not extract bannerid after creating banner. URL: {self.page.url}")
-        return banner_id
+        if banner_id:
+            return banner_id
+
+        # Navigate to banner list and find it
+        self.page.goto(self._url(
+            f'campaign-banners.php?clientid={client_id}&campaignid={campaign_id}'
+        ))
+        self.page.wait_for_load_state('networkidle')
+
+        rows = self.page.locator('table tbody:nth-child(2) tr').all()
+        for row in rows:
+            first_cell = row.locator('td').first
+            cell_text = first_cell.inner_text().strip()
+            if name in cell_text:
+                id_match = re.search(r'\[(\d+)\]', cell_text)
+                if id_match:
+                    return int(id_match.group(1))
+
+        raise RuntimeError(f"Could not find bannerid after creating banner.")
 
     def get_banners_in_campaign(self, client_id: int, campaign_id: int) -> list[dict]:
         """Get all banners in a campaign with their IDs."""
@@ -473,71 +531,125 @@ class ReviveBot:
     ) -> int:
         """Link a campaign to matching zones via campaign-zone.php.
 
-        Uses the Available/Linked Zones two-panel UI on the campaign page.
-        If target_sizes is provided, only zones matching those (w, h) are linked.
-        If None, all available zones are linked.
+        Uses the search box to filter Available Zones by size, then
+        Select All + Link, repeating across paginated results.
 
-        Returns the number of zones linked.
+        Returns the number of link operations performed.
         """
         self.page.goto(self._url(
             f'campaign-zone.php?clientid={client_id}&campaignid={campaign_id}'
         ))
         self.page.wait_for_load_state('networkidle')
 
-        # The page has two tables side by side:
-        #   Left:  Available Zones (first table with checkboxes)
-        #   Right: Linked Zones (second table with checkboxes)
-        # Below them: "Link" and "Unlink" buttons
-
-        # Find all checkboxes in the Available Zones panel (left side).
-        # Available zones are in the first table within the two-panel container.
-        # Each zone row has a checkbox and a label like "Leaderboard (728x90)".
-        # Website rows also have checkboxes but no size in parentheses.
-
-        # The available zones table is the first one; we identify zone checkboxes
-        # by their label containing a size pattern like "(WxH)" or "(W x H)".
-        available_table = self.page.locator('table').first
-        available_checkboxes = available_table.get_by_role('checkbox').all()
-
-        linked_count = 0
-        checked_any = False
-
-        for cb in available_checkboxes:
-            # Get the label text - it's in a sibling text node or parent element
-            parent = cb.locator('..')
-            label_text = parent.inner_text().strip()
-
-            # Skip "Select / Unselect All" checkbox
-            if 'select' in label_text.lower() and 'all' in label_text.lower():
-                continue
-
-            # Skip website-level checkboxes (no size in parens)
-            size = parse_size_text(label_text)
-
-            if target_sizes is not None:
-                # Only check zones matching our target sizes
-                if size and size in target_sizes:
-                    cb.check()
-                    checked_any = True
-                    linked_count += 1
-                    print(f"    Selecting: {label_text}")
-            else:
-                # Link all available zones
-                if size:
-                    cb.check()
-                    checked_any = True
-                    linked_count += 1
-                    print(f"    Selecting: {label_text}")
-
-        if checked_any:
-            link_button = self.page.get_by_role('button', name='Link')
-            link_button.click()
-            self.page.wait_for_load_state('networkidle')
-            print(f"    Clicked Link.")
+        # Build search terms from target sizes (e.g., "300x250")
+        if target_sizes:
+            search_terms = [f'{w}x{h}' for w, h in target_sizes]
         else:
-            print(f"    No matching available zones to link.")
+            search_terms = ['']  # empty search = show all
 
-        return linked_count
+        total_linked = 0
+
+        for search_term in search_terms:
+            if search_term:
+                print(f"    Searching for: {search_term}")
+
+            # Type in the Available Zones search box and press Enter
+            search_box = self.page.locator('#quick-search-available')
+            search_box.clear()
+            if search_term:
+                search_box.fill(search_term)
+            search_box.press('Enter')
+            self.page.wait_for_load_state('networkidle')
+            import time
+            time.sleep(1)  # wait for AJAX filter
+
+            # Loop: Select All on current page, click Link, repeat until done
+            while True:
+                # Check if there are any available zone checkboxes
+                select_all = self.page.locator('input[name="selectAll"][type="checkbox"]').first
+                if select_all.count() == 0:
+                    # Try alternative selector
+                    select_all = self.page.get_by_role('checkbox', name='Select / Unselect All').first
+
+                if select_all.count() == 0:
+                    break
+
+                # Check Select All
+                select_all.check()
+
+                # Click Link button
+                link_button = self.page.locator('#link-button')
+                if link_button.is_disabled():
+                    print(f"    Link button disabled - no zones to link.")
+                    break
+
+                link_button.click()
+                self.page.wait_for_load_state('networkidle')
+                time.sleep(1)
+                total_linked += 1
+                print(f"    Linked a page of zones.")
+
+                # Check if there are still available zones to link
+                # The page refreshes after linking - if search is still active,
+                # remaining zones on the next page will now be on page 1
+                available_text = self.page.locator('text=Available:').first
+                if available_text.count() > 0:
+                    parent_text = available_text.locator('..').inner_text()
+                    if 'Available: 0' in parent_text:
+                        break
+                else:
+                    break
+
+        return total_linked
+
+    def get_zone_invocation_code(self, affiliate_id: int, zone_id: int) -> str:
+        """Get the async JS invocation code for a zone with optimal settings."""
+        self.page.goto(self._url(
+            f'zone-invocation.php?affiliateid={affiliate_id}&zoneid={zone_id}'
+        ))
+        self.page.wait_for_load_state('networkidle')
+
+        # Set "Don't show the banner again on the same page" to Yes
+        unique_radio = self.page.locator('input[name="uniqueid"][value="1"], input[name="block"][value="1"]').first
+        if unique_radio.count() > 0:
+            unique_radio.check()
+
+        # Set "Don't show a banner from the same campaign again on the same page" to Yes
+        no_campaign_radio = self.page.locator('input[name="blockcampaign"][value="1"]').first
+        if no_campaign_radio.count() > 0:
+            no_campaign_radio.check()
+
+        # Set "Target frame" to "New window"
+        target_select = self.page.locator('select[name="target"]')
+        if target_select.count() > 0:
+            target_select.select_option(label='New window')
+
+        # Click Refresh to regenerate code with new settings
+        self.page.get_by_role('button', name='Refresh').click()
+        self.page.wait_for_load_state('networkidle')
+
+        # The code is in a textarea/textbox in the Bannercode section
+        code_box = self.page.locator('textarea, input[type="text"]').last
+        return code_box.input_value()
+
+    def get_all_zone_codes(self) -> list[dict]:
+        """Get invocation codes for all zones across all websites."""
+        websites = self.get_websites()
+        results = []
+        for ws in websites:
+            zones = self.get_zones(ws['affiliateid'])
+            for zone in zones:
+                print(f"  Getting code for: {ws['name']} - {zone['name']}")
+                code = self.get_zone_invocation_code(zone['affiliateid'], zone['zoneid'])
+                results.append({
+                    'website': ws['name'],
+                    'zone_name': zone['name'],
+                    'zone_id': zone['zoneid'],
+                    'width': zone['width'],
+                    'height': zone['height'],
+                    'code': code,
+                })
+        return results
 
 
 def run_create(args, bot, revive_url):
@@ -574,12 +686,12 @@ def run_create(args, bot, revive_url):
         if args.campaign_id:
             print(f"  Would use existing campaign ID: {args.campaign_id}")
         else:
-            for (w, h) in size_groups:
-                name = args.campaign or f"{w}x{h} Banners"
-                print(f"  Would create campaign: {name}")
+            campaign_name = args.campaign or args.advertiser
+            print(f"  Would create campaign: {campaign_name}")
         print(f"  Would create {len(images)} banner(s) (target=_blank)")
         if not args.skip_zone_link:
-            print(f"  Would link campaigns to zones matching their dimensions")
+            sizes_str = ', '.join(f'{w}x{h}' for w, h in size_groups)
+            print(f"  Would link campaign to zones matching: {sizes_str}")
         sys.exit(0)
 
     # -- Login ----------------------------------------------------------------
@@ -596,36 +708,21 @@ def run_create(args, bot, revive_url):
         client_id = bot.create_advertiser(args.advertiser)
         print(f"  Created advertiser ID: {client_id}")
 
-    # -- Create campaigns -----------------------------------------------------
+    # -- Create or use campaign (single campaign for all sizes) ---------------
     created_banners = []
-    campaign_by_size = {}
 
     if args.campaign_id:
-        for (w, h) in size_groups:
-            campaign_by_size[(w, h)] = args.campaign_id
-        print(f"Using existing campaign ID: {args.campaign_id}")
+        campaign_id = args.campaign_id
+        print(f"Using existing campaign ID: {campaign_id}")
     else:
-        if args.campaign and len(size_groups) == 1:
-            (w, h) = list(size_groups.keys())[0]
-            print(f"\nCreating campaign: {args.campaign}")
-            campaign_id = bot.create_campaign(client_id, args.campaign)
-            campaign_by_size[(w, h)] = campaign_id
-            print(f"  Created campaign ID: {campaign_id}")
-        else:
-            for (w, h) in size_groups:
-                name = args.campaign or f"{w}x{h} Banners"
-                if len(size_groups) > 1:
-                    name = f"{w}x{h} Banners"
-                print(f"\nCreating campaign: {name}")
-                campaign_id = bot.create_campaign(client_id, name)
-                campaign_by_size[(w, h)] = campaign_id
-                print(f"  Created campaign ID: {campaign_id}")
+        campaign_name = args.campaign or args.advertiser
+        print(f"\nCreating campaign: {campaign_name}")
+        campaign_id = bot.create_campaign(client_id, campaign_name)
+        print(f"  Created campaign ID: {campaign_id}")
 
     # -- Create banners -------------------------------------------------------
     print(f"\nCreating {len(images)} banner(s)...")
     for img in images:
-        size_key = (img['width'], img['height'])
-        campaign_id = campaign_by_size[size_key]
         print(f"\n  [{img['path'].name}] {img['width']}x{img['height']}")
 
         try:
@@ -644,37 +741,32 @@ def run_create(args, bot, revive_url):
                 'name': img['name'],
                 'width': img['width'],
                 'height': img['height'],
-                'campaign_id': campaign_id,
             })
         except Exception as e:
             print(f"    ERROR creating banner: {e}")
             continue
 
-    # -- Link campaigns to zones ----------------------------------------------
+    # -- Link campaign to zones matching all banner sizes ----------------------
     total_links = 0
     if not args.skip_zone_link:
-        print("\nLinking campaigns to matching zones...")
-
-        for (w, h), campaign_id in campaign_by_size.items():
-            print(f"\n  Campaign {campaign_id} ({w}x{h}):")
-            try:
-                count = bot.link_campaign_to_zones(
-                    client_id=client_id,
-                    campaign_id=campaign_id,
-                    target_sizes={(w, h)},
-                )
-                total_links += count
-            except Exception as e:
-                print(f"    ERROR linking: {e}")
+        all_sizes = set(size_groups.keys())
+        sizes_str = ', '.join(f'{w}x{h}' for w, h in all_sizes)
+        print(f"\nLinking campaign {campaign_id} to zones matching: {sizes_str}")
+        try:
+            total_links = bot.link_campaign_to_zones(
+                client_id=client_id,
+                campaign_id=campaign_id,
+                target_sizes=all_sizes,
+            )
+        except Exception as e:
+            print(f"  ERROR linking: {e}")
 
     # -- Summary --------------------------------------------------------------
     print("\n" + "=" * 60)
     print("SUMMARY")
     print("=" * 60)
     print(f"  Advertiser ID:   {client_id}")
-    print(f"  Campaigns:       {len(campaign_by_size)}")
-    for (w, h), cid in campaign_by_size.items():
-        print(f"    {w}x{h} -> Campaign ID {cid}")
+    print(f"  Campaign ID:     {campaign_id}")
     print(f"  Banners created: {len(created_banners)}")
     if not args.skip_zone_link:
         print(f"  Zone links made: {total_links}")
@@ -741,6 +833,41 @@ def run_create_website(args, bot, revive_url):
         for z in result['zones']:
             print(f"    {z['name']} (ID: {z['zoneid']})")
     print()
+
+
+def run_get_zone_codes(args, bot, revive_url):
+    """Pull invocation codes for all zones and save to a file."""
+    print(f"\nLogging in to {revive_url}...")
+    bot.login()
+    print("  Logged in successfully.")
+
+    print("\nFetching zone invocation codes...")
+    codes = bot.get_all_zone_codes()
+
+    if not codes:
+        print("  No zones found.")
+        return
+
+    # Group by size
+    by_size = defaultdict(list)
+    for entry in codes:
+        by_size[(entry['width'], entry['height'])].append(entry)
+
+    # Write to file
+    output_file = Path('zone-codes.html')
+    with open(output_file, 'w') as f:
+        for (w, h), entries in sorted(by_size.items()):
+            f.write(f'<!-- ===== {w}x{h} Zones ===== -->\n\n')
+            for entry in entries:
+                f.write(f'<!-- Website: {entry["website"]} | Zone: {entry["zone_name"]} | ID: {entry["zone_id"]} | Size: {w}x{h} -->\n')
+                f.write(f'{entry["code"]}\n\n')
+
+    print(f"\n  Saved {len(codes)} zone code(s) to {output_file}")
+
+    # Also print summary
+    print(f"\n  Zones by size:")
+    for (w, h), entries in sorted(by_size.items()):
+        print(f"    {w}x{h}: {len(entries)} zone(s)")
 
 
 def run_strip_quotes(args, bot, revive_url):
@@ -967,6 +1094,11 @@ def main():
         action='store_true',
         help='Remove quote characters from all website names and contacts',
     )
+    parser.add_argument(
+        '--get-zone-codes',
+        action='store_true',
+        help='Pull async JS invocation codes for all zones, grouped by size',
+    )
 
     args = parser.parse_args()
     load_dotenv()
@@ -980,15 +1112,17 @@ def main():
         print("Copy .env.example to .env and fill in your values.")
         sys.exit(1)
 
-    if not args.update_banners and not args.create_website and not args.create_websites and not args.setup_zones and not args.strip_quotes and not args.image_folder:
-        print("ERROR: image_folder is required (or use --update-banners / --create-website / --create-websites / --setup-zones / --strip-quotes)")
+    if not args.update_banners and not args.create_website and not args.create_websites and not args.setup_zones and not args.strip_quotes and not args.get_zone_codes and not args.image_folder:
+        print("ERROR: image_folder is required (or use --update-banners / --create-website / --create-websites / --setup-zones / --get-zone-codes)")
         sys.exit(1)
 
     bot = ReviveBot(revive_url, username, password, headless=not args.headed)
     bot.start()
 
     try:
-        if args.strip_quotes:
+        if args.get_zone_codes:
+            run_get_zone_codes(args, bot, revive_url)
+        elif args.strip_quotes:
             run_strip_quotes(args, bot, revive_url)
         elif args.setup_zones:
             run_setup_zones(args, bot, revive_url)
